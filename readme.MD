@@ -36,10 +36,17 @@ Follow these steps to set up your project for the first time:
    pip install -r requirements.txt
    or
    pip install selenium beautifulsoup4 requests
-   py chrome.py  
    ```  
+   (Note: You may need to install additional packages depending on your system configuration.)
 
-4. Run the script:
+4. Run the script to check chrome and chromedriver versions:
+    ```sh
+    py chrome.py
+    ```   
+    (Note: You may need to install the correct version of chromedriver based on your chrome version)
+
+5. Run the script to download media:
     ```sh
     py vsco.py
-    ```    
+    ```   
+    (Note: You may need to adjust the script to suit your needs)
