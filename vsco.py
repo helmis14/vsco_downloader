@@ -10,6 +10,10 @@ import urllib.request as ur
 import traceback as tb
 import json
 import re
+from bs4 import BeautifulSoup
+from html import unescape
+from tqdm import tqdm
+import time
 
 
 chrome_options = Options()
@@ -164,26 +168,24 @@ def login_to_vsco(driver):
 
 def extract_vsco_links(url):
     driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
+
     try:
         login_to_vsco(driver)
         driver.get(url)
-        print(get_text("open_profile_page", bahasa, url=profile_url))
+        print(get_text("open_profile_page", bahasa, url=url))
         time.sleep(5)
 
-        
-        while True:
-            try:
-                load_more_button = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "grain-button"))
-                )
-                print(get_text("load_more_button", bahasa))
-                load_more_button.click()
-                time.sleep(3)
-            except Exception:
-                print(get_text("no_more_load_more", bahasa))
-                break
+        # Klik tombol Load more langsung (tanpa if)
+        load_more_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "grain-button"))
+        )
+        print(get_text("load_more_button", bahasa))
+        driver.execute_script("arguments[0].scrollIntoView(true);", load_more_button)
+        time.sleep(2)
+        load_more_button.click()
+        time.sleep(2)
 
-        
+        # Scroll hingga tidak ada perubahan lagi
         last_height = 0
         while True:
             print(get_text("scroll_down", bahasa))
@@ -196,7 +198,7 @@ def extract_vsco_links(url):
                 break
             last_height = new_height
 
-       
+        # Ambil semua tautan media
         print(get_text("fetch_links", bahasa))
         links = driver.find_elements(By.CSS_SELECTOR, "a")
         post_links = [
@@ -205,55 +207,123 @@ def extract_vsco_links(url):
             if link.get_attribute("href") and "media" in link.get_attribute("href")
         ]
 
-       
-        unique_links = list(set(post_links))
-        return unique_links
+        return list(set(post_links))
 
     except Exception as e:
         print(f"[ERROR] Terjadi kesalahan: {e}")
+        tb.print_exc()
         return []
+
     finally:
         driver.quit()
 
 
-def download(vsco_media_url, output_path, get_video_thumbnails=True, save=True):
-    request_header = {"User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64)"}
-    request = ur.Request(vsco_media_url, headers=request_header)
-    data = ur.urlopen(request).read()
 
-    data_cleaned_1 = str(data).split("<script>window.__PRELOADED_STATE__ =")[1]
-    data_cleaned_2 = str(data_cleaned_1).split("</script>")[0]
-    data_cleaned_3 = str(data_cleaned_2).strip()
-    data_cleaned_4 = str(data_cleaned_3).replace("\\x", "\\u00")
-    data_cleaned_5 = re.sub(r'(?<!\\)\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})', r'', data_cleaned_4)
+def download_file(url, dest_path):
+    """Unduh file dengan progress bar dan headers agar tidak diblokir."""
+    req = ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with ur.urlopen(req) as response:
+        total = int(response.getheader('Content-Length', 0))
+        with open(dest_path, 'wb') as out_file, tqdm(
+            desc=os.path.basename(dest_path),
+            total=total,
+            unit='B',
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar:
+            while True:
+                buffer = response.read(1024)
+                if not buffer:
+                    break
+                out_file.write(buffer)
+                bar.update(len(buffer))
+
+def download(vsco_media_url, output_path, get_video_thumbnails=True, save=True, current_index=1, total=1):
 
     try:
-        json_data = json.loads(data_cleaned_5)
-    except Exception as e:
-        print("ERROR: Failed to load json data!")
-        tb.print_exc()
-        return 1
+        request_header = {"User-Agent": "Mozilla/5.0"}
+        request = ur.Request(vsco_media_url, headers=request_header)
+        data = ur.urlopen(request).read().decode('utf-8')  # HTML as string
 
-    opener = ur.build_opener()
-    opener.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 6.1; Win64; x64)")]
-    ur.install_opener(opener)
+        match = re.search(r'window\.__PRELOADED_STATE__\s*=\s*(\{.*?\})\s*</script>', data, re.DOTALL)
+        if not match:
+            print("[INFO] Parsing JSON gagal, lanjut ke fallback HTML parsing...")
+            raise ValueError("JSON not found")
+
+        json_raw = match.group(1)
+        json_data = json.loads(json_raw)
+    except Exception:
+        print("[INFO] Parsing JSON gagal, lanjut ke fallback HTML parsing...")
+
+        try:
+            soup = BeautifulSoup(data, "html.parser")
+            video_tag = soup.find("video")
+            if video_tag and video_tag.has_attr("poster"):
+                video_poster = unescape(video_tag["poster"])
+                filename = os.path.basename(video_poster.split("?")[0])
+                media_path = os.path.join(output_path, filename)
+                if os.path.exists(media_path):
+                    print(f"[SKIP] {current_index}/{total} Sudah ada: {filename}")
+                    return 0
+                if save:
+                    download_file(video_poster, media_path)
+                print(f"[INFO] {current_index}/{total} Mengunduh: {filename}")
+                print(f"[SUCCESS] Fallback video poster downloaded: {media_path}")
+                return 0
+
+            img_tag = soup.find("img")
+            if img_tag and img_tag.has_attr("src") and "vsco" in img_tag["src"]:
+                img_url = unescape(img_tag["src"])
+                if img_url.startswith("//"):
+                    img_url = "https:" + img_url
+                filename = os.path.basename(img_url.split("?")[0])
+                media_path = os.path.join(output_path, filename)
+                if os.path.exists(media_path):
+                    print(f"[SKIP] Sudah ada: {filename}")
+                    return 0
+                if save:
+                    download_file(img_url, media_path)
+                print(f"[INFO] {current_index}/{total} Mengunduh: {filename}")
+                print(f"[SUCCESS] Fallback image downloaded: {media_path}")
+                return 0
+
+            print("[ERROR] Fallback HTML parsing gagal: Tidak menemukan media!")
+            return 1
+        except Exception:
+            print("[ERROR] Fallback HTML parsing gagal sepenuhnya!")
+            tb.print_exc()
+            return 1
 
     try:
         medias = json_data["medias"]["byId"]
-        for media in medias:
-            info = medias[media]["media"]
-            media_name = os.path.join(output_path, f"{media}.{'mp4' if bool(info['isVideo']) else 'jpg'}")
-            media_url = "https://" + str(
-                (info["videoUrl"] if bool(info["isVideo"]) else info["responsiveUrl"]).encode().decode("unicode-escape")
+        total = len(medias)
+        for i, (media_id, media_obj) in enumerate(medias.items(), start=1):
+            info = media_obj["media"]
+            is_video = info.get("isVideo", False)
+            filename = f"{media_id}.{'mp4' if is_video else 'jpg'}"
+            media_url = "https://" + (
+                info.get("videoUrl") if is_video else info.get("responsiveUrl", "")
             )
+            media_url = media_url.encode().decode("unicode-escape")
+            media_path = os.path.join(output_path, filename)
+
+            if os.path.exists(media_path):
+                print(f"[SKIP] {i}/{total} Sudah ada: {filename}")
+                continue
+
+            print(f"[INFO] {current_index}/{total} Mengunduh: {filename}")
             if save:
-                ur.urlretrieve(media_url, media_name)
-            print(get_text("download_success", bahasa, filename=media_name))
-    except Exception as e:
-        print("ERROR: Failed to extract image/video location!")
+                start_time = time.time()
+                download_file(media_url, media_path)
+                elapsed = time.time() - start_time
+                print(f"[INFO] Selesai {current_index}/{total} ({elapsed:.2f}s): {filename}")
+
+        return 0
+
+    except Exception:
+        print("ERROR: Gagal mengambil data media dari JSON.")
         tb.print_exc()
         return 1
-
 
 def read_links_from_file(file_path):
     links = []
@@ -263,6 +333,12 @@ def read_links_from_file(file_path):
     except FileNotFoundError:
         print(f"[ERROR] File {file_path} tidak ditemukan!")
     return links
+
+def extract_username_from_url(url):
+    """Ambil username dari link VSCO."""
+    match = re.search(r"vsco\.co/([^/]+)/", url)
+    return match.group(1) if match else "unknown"
+
 
 
 
@@ -299,32 +375,37 @@ if __name__ == '__main__':
             print(get_text("error", bahasa, error=e))
 
     elif metode == "file":
-       
         links_file_path = os.path.join(os.getcwd(), "links.txt")
         links = read_links_from_file(links_file_path)
 
         if links:
             print(get_text("found_links", bahasa, count=len(links)))
-            output_dir = os.path.join(os.getcwd(), "downloads")
+
+            first_username = extract_username_from_url(links[0])
+            output_dir = os.path.join(os.getcwd(), "downloads", first_username)
             os.makedirs(output_dir, exist_ok=True)
-            for link in links:
-                download(link, output_dir)
+
+            total_links = len(links)
+            for idx, link in enumerate(links, 1):
+                download(link, output_dir, current_index=idx, total=total_links)
+
             print(get_text("download_complete", bahasa, folder=output_dir))
         else:
             print(get_text("error", bahasa, error="Tidak ada tautan yang ditemukan."))
+
     
-    
+
     elif metode == "single_link":
-        
         url = input(get_text("enter_media_url", bahasa)) 
         print(f"[INFO] {get_text('start_downloading', bahasa)} {url}...")  
 
-        output_dir = os.path.join(os.getcwd(), "single_link_downloads")
+        username = extract_username_from_url(url)
+        output_dir = os.path.join(os.getcwd(), "downloads", username)
         os.makedirs(output_dir, exist_ok=True)
 
         try:
-            
-            download(url, output_dir)
+            download(url, output_dir, current_index=1, total=1)
             print(get_text("download_complete", bahasa, folder=output_dir))
         except Exception as e:
             print(get_text("error", bahasa, error="Terjadi kesalahan saat mengunduh media."))
+
